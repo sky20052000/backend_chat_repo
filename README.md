@@ -1,4 +1,4 @@
-# Relationship & Coach Platform — Chat Backend
+# Chat Backend
 
 Modular-monolith chat service built with Express, strict TypeScript, PostgreSQL (`pg` with parameterized SQL; no ORM), Firebase Firestore, and Socket.IO.
 
