@@ -1,107 +1,115 @@
-import { FieldPath, Timestamp } from "firebase-admin/firestore";
-import type { QueryDocumentSnapshot } from "firebase-admin/firestore";
-import type { PoolClient } from "pg";
+import { Timestamp } from "firebase-admin/firestore";
 import { firestore } from "../firebase/admin";
 import { logger } from "../logging/logger";
 import { pool } from "./pool";
 
 const batchSize = 250;
 
+interface LegacyMessage {
+  id: string;
+  chat_id: string;
+  sender_id: string;
+  text: string;
+  created_at_seconds: string;
+  created_at_nanoseconds: string;
+}
+
 async function backfillMessages(): Promise<void> {
-  const chats = await pool.query<{ id: string }>("SELECT id FROM chats ORDER BY id");
+  let cursor: { chatId: string; messageId: string } | undefined;
   let processedMessages = 0;
 
-  for (const { id: chatId } of chats.rows) {
-    let lastDocument: QueryDocumentSnapshot | undefined;
-    while (true) {
-      let query = firestore.collection("chats").doc(chatId)
-        .collection("messages")
-        .orderBy(FieldPath.documentId())
-        .limit(batchSize);
-      if (lastDocument) {
-        query = query.startAfter(lastDocument);
-      }
+  while (true) {
+    const result = cursor
+      ? await pool.query<LegacyMessage>(
+        `SELECT id, chat_id, sender_id, text,
+                floor(extract(epoch FROM created_at))::bigint::text AS created_at_seconds,
+                floor((extract(epoch FROM created_at) - floor(extract(epoch FROM created_at)))
+                  * 1000000000)::bigint::text AS created_at_nanoseconds
+         FROM messages
+         WHERE (chat_id, id) > ($1::uuid, $2::text)
+         ORDER BY chat_id, id
+         LIMIT $3`,
+        [cursor.chatId, cursor.messageId, batchSize]
+      )
+      : await pool.query<LegacyMessage>(
+        `SELECT id, chat_id, sender_id, text,
+                floor(extract(epoch FROM created_at))::bigint::text AS created_at_seconds,
+                floor((extract(epoch FROM created_at) - floor(extract(epoch FROM created_at)))
+                  * 1000000000)::bigint::text AS created_at_nanoseconds
+         FROM messages
+         ORDER BY chat_id, id
+         LIMIT $1`,
+        [batchSize]
+      );
 
-      const page = await query.get();
-      if (page.empty) {
-        break;
-      }
-
-      const rows = page.docs.map((document) => {
-        const data = document.data();
-        if (
-          document.id.length > 150 ||
-          typeof data.senderId !== "string" ||
-          typeof data.text !== "string" ||
-          data.text.trim().length === 0 ||
-          data.text.length > 10_000 ||
-          !(data.createdAt instanceof Timestamp)
-        ) {
-          throw new Error(`Legacy message ${chatId}/${document.id} has invalid stored data`);
-        }
-        return {
-          id: document.id,
-          chatId,
-          senderId: data.senderId,
-          text: data.text,
-          createdAt: data.createdAt.toDate()
-        };
-      });
-
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        const result = await client.query(
-          `INSERT INTO messages (id, chat_id, sender_id, text, created_at)
-           SELECT imported.id, imported.chat_id, imported.sender_id, imported.text, imported.created_at
-           FROM UNNEST(
-             $1::text[], $2::uuid[], $3::text[], $4::text[], $5::timestamptz[]
-           ) AS imported(id, chat_id, sender_id, text, created_at)
-           ON CONFLICT (id) DO UPDATE
-             SET id = EXCLUDED.id
-             WHERE (messages.chat_id, messages.sender_id, messages.text, messages.created_at)
-               IS NOT DISTINCT FROM
-               (EXCLUDED.chat_id, EXCLUDED.sender_id, EXCLUDED.text, EXCLUDED.created_at)
-           RETURNING id`,
-          [
-            rows.map((row) => row.id),
-            rows.map((row) => row.chatId),
-            rows.map((row) => row.senderId),
-            rows.map((row) => row.text),
-            rows.map((row) => row.createdAt)
-          ]
-        );
-        if (result.rowCount !== rows.length) {
-          throw new Error(`Legacy message ID conflict while backfilling chat ${chatId}`);
-        }
-        const latestMessageDate = rows.reduce<Date | undefined>(
-          (latest, row) => !latest || row.createdAt > latest ? row.createdAt : latest,
-          undefined
-        );
-        if (latestMessageDate) {
-          await client.query(
-            "UPDATE chats SET updated_at = GREATEST(updated_at, $2) WHERE id = $1::uuid",
-            [chatId, latestMessageDate]
-          );
-        }
-        await client.query("COMMIT");
-        processedMessages += rows.length;
-      } catch (error) {
-        try {
-          await client.query("ROLLBACK");
-        } catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "Message backfill and rollback failed");
-        }
-        throw error;
-      } finally {
-        client.release();
-      }
-
-      lastDocument = page.docs[page.docs.length - 1];
+    if (result.rows.length === 0) {
+      break;
     }
+
+    const rows = result.rows.map((row) => {
+      const seconds = Number(row.created_at_seconds);
+      const nanoseconds = Number(row.created_at_nanoseconds);
+      if (
+        row.id.length === 0 ||
+        row.id.length > 150 ||
+        row.id.includes("/") ||
+        row.sender_id.length === 0 ||
+        row.text.trim().length === 0 ||
+        row.text.length > 10_000 ||
+        !Number.isSafeInteger(seconds) ||
+        !Number.isInteger(nanoseconds) ||
+        nanoseconds < 0 ||
+        nanoseconds > 999_999_999
+      ) {
+        throw new Error(`Legacy message ${row.chat_id}/${row.id} has invalid stored data`);
+      }
+      return { ...row, timestamp: new Timestamp(seconds, nanoseconds) };
+    });
+
+    const references = rows.map((row) =>
+      firestore.collection("chats").doc(row.chat_id).collection("messages").doc(row.id)
+    );
+    const existingDocuments = await firestore.getAll(...references);
+    const batch = firestore.batch();
+
+    rows.forEach((row, index) => {
+      const existing = existingDocuments[index];
+      if (!existing) {
+        throw new Error(`Unable to inspect Firestore message ${row.chat_id}/${row.id}`);
+      }
+      if (existing.exists) {
+        const data = existing.data();
+        if (
+          data?.chatId !== row.chat_id ||
+          data?.senderId !== row.sender_id ||
+          data?.text !== row.text ||
+          !(data.createdAt instanceof Timestamp) ||
+          data.createdAt.seconds !== row.timestamp.seconds ||
+          data.createdAt.nanoseconds !== row.timestamp.nanoseconds
+        ) {
+          throw new Error(`Legacy message ID conflict while backfilling chat ${row.chat_id}`);
+        }
+        return;
+      }
+
+      batch.create(references[index]!, {
+        chatId: row.chat_id,
+        senderId: row.sender_id,
+        text: row.text,
+        createdAt: row.timestamp
+      });
+    });
+
+    await batch.commit();
+    processedMessages += rows.length;
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) {
+      throw new Error("Message backfill returned an empty page");
+    }
+    cursor = { chatId: lastRow.chat_id, messageId: lastRow.id };
   }
 
-  logger.info({ chats: chats.rowCount, messages: processedMessages }, "Firestore message backfill completed");
+  logger.info({ messages: processedMessages }, "Firestore message backfill completed");
 }
 
 async function main(): Promise<void> {

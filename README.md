@@ -6,11 +6,11 @@ Modular-monolith chat service built with Express, strict TypeScript, PostgreSQL 
 
 - `modules/auth`: verifies Firebase ID tokens for HTTP and Socket.IO.
 - `modules/chats`: direct-chat application logic and PostgreSQL repository.
-- `modules/messages`: PostgreSQL message persistence and Firestore read-receipt/last-seen operations.
+- `modules/messages`: Firestore message, read-receipt, and last-seen persistence.
 - `modules/realtime`: authenticated chat room membership and socket message events.
 - `infra`: PostgreSQL pool/migration, Firebase Admin SDK, and structured logging.
 
-PostgreSQL stores Firebase UID-keyed users, chats, memberships, and messages. User records should be created by the platform's user-registration workflow before chat creation. Firestore stores read receipts under each chat message's `readReceipts` subcollection and per-user last-seen documents under `lastSeen`.
+PostgreSQL stores Firebase UID-keyed users, chats, and memberships. User records should be created by the platform's user-registration workflow before chat creation. Firestore stores messages under `chats/{chatId}/messages`, read receipts under each message's `readReceipts` subcollection, and per-user last-seen documents under `lastSeen`. The PostgreSQL `messages` table is retained as a legacy migration source and is not used for normal message operations.
 
 ## Setup
 
@@ -26,7 +26,7 @@ PostgreSQL stores Firebase UID-keyed users, chats, memberships, and messages. Us
 5. Run `npm install`, `npm run build`, `npm run db:migrate`, and `npm run dev`.
 6. `npm start` runs the compiled server.
 
-Database migrations are plain SQL files under `src/infra/database/migrations`. The build copies them alongside the compiled migration runner. Apply them through `npm run db:migrate` after building. For an existing installation, pause chat writes, apply the migration, and run `npm run db:backfill-messages` before deploying the PostgreSQL-backed version. The backfill is safe to rerun. Resume chat writes only after the new application instances are running, or messages created during cutover could be missed.
+Database migrations are plain SQL files under `src/infra/database/migrations`. The build copies them alongside the compiled migration runner. Apply them through `npm run db:migrate` after building. When moving an existing installation's PostgreSQL messages to Firestore, pause chat writes, run `npm run db:backfill-messages`, and only then deploy this version. The backfill preserves message IDs and timestamps, is safe to rerun, and stops on conflicting Firestore records rather than overwriting them. Keep writes paused through cutover so messages created during migration are not missed.
 
 ## Authentication and authorization
 
@@ -57,4 +57,4 @@ Send `Authorization: Bearer <Firebase ID token>` for every REST endpoint. Socket
 - Set `CORS_ORIGINS` to the exact comma-separated frontend origins for each deployment.
 - HTTP requests are protected by Helmet, JSON size limits, CORS, and a per-process rate limit. Use a shared rate-limit store when running multiple replicas.
 - Keep Firebase credentials in a secret manager or workload identity in production. Never commit credentials.
-- Messages are stored in PostgreSQL and indexed by chat and creation time. Pagination uses an opaque cursor so clients can fetch older messages without offset scans. Firestore remains the store for read receipts and last-seen metadata.
+- Messages are stored in Firestore with server-generated timestamps. Pagination uses an opaque Firestore timestamp/document-ID cursor so clients can fetch older messages without offset scans. Chat activity timestamps remain in PostgreSQL.

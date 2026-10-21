@@ -2,12 +2,14 @@ import { z } from "zod";
 import { AppError } from "../../shared/errors/app-error";
 
 export interface MessageCursor {
-  createdAt: string;
+  seconds: number;
+  nanoseconds: number;
   messageId: string;
 }
 
 const cursorSchema = z.object({
-  createdAt: z.string().min(1).max(100),
+  seconds: z.number().int().min(-62_135_596_800).max(253_402_300_799),
+  nanoseconds: z.number().int().min(0).max(999_999_999),
   messageId: z.string().min(1).max(150)
 }).strict();
 
@@ -31,7 +33,7 @@ export function decodeMessageCursor(value: string | undefined): MessageCursor | 
   }
 
   const result = cursorSchema.safeParse(decoded);
-  if (!result.success || !Number.isFinite(Date.parse(result.data.createdAt))) {
+  if (!result.success) {
     throw new AppError(400, "Invalid message cursor");
   }
   return result.data;
