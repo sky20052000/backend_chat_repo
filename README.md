@@ -6,7 +6,7 @@ Modular-monolith chat service built with Express, strict TypeScript, PostgreSQL 
 
 - `modules/auth`: verifies Firebase ID tokens for HTTP and Socket.IO.
 - `modules/chats`: direct-chat application logic and PostgreSQL repository.
-- `modules/messages`: message, read-receipt, and last-seen operations in Firestore.
+- `modules/messages`: PostgreSQL message persistence and Firestore read-receipt/last-seen operations.
 - `modules/realtime`: authenticated chat room membership and socket message events.
 - `infra`: PostgreSQL pool/migration, Firebase Admin SDK, and structured logging.
 
@@ -16,7 +16,7 @@ PostgreSQL stores Firebase UID-keyed users, chats, memberships, and messages. Us
 
 1. Install Node.js 20 or later and PostgreSQL 14 or later.
 2. Create a PostgreSQL database and copy `.env.example` to `.env`.
-3. Configure `DATABASE_URL`, `FIREBASE_PROJECT_ID`, and Firebase Application Default Credentials. For local development, `GOOGLE_APPLICATION_CREDENTIALS` may point to a service-account JSON file; do not commit that file.
+3. Configure `DATABASE_URL`, `FIREBASE_PROJECT_ID`, and Firebase credentials. For local development, put the service-account JSON at `secrets/firebase-service-account.json` and set `GOOGLE_APPLICATION_CREDENTIALS=./secrets/firebase-service-account.json`. The `secrets/` directory is git-ignored; never commit credential files. Enable the Cloud Firestore API and create a Firestore database in the Firebase project before using read receipts or last-seen.
 4. Insert user records using the Firebase UID as `users.id`, for example:
 
    ```sql
